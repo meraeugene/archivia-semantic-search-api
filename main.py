@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -8,6 +8,7 @@ from sentence_transformers import SentenceTransformer
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
+
 
 # ===========================
 # FastAPI Setup
@@ -50,7 +51,7 @@ if df.empty:
     raise ValueError("❌ No theses found in database")
 
 # ===========================
-# Build Search Index WITHOUT abstract and category
+# Build Search Index 
 # ===========================
 df["text"] = (
     df["title"].fillna("") + " " +
@@ -74,37 +75,58 @@ sbert_matrix = sbert.encode(df["text"], convert_to_numpy=True)
 
 print("✅ AI models ready!")
 
+PAGE_SIZE = 6  # number of theses per page
+
 # ===========================
 # SEARCH API
 # ===========================
+
 @app.get("/search")
-def search(query: str):
+def search(query: str, page: int = Query(1, ge=1)):
     if not query.strip():
         return []
 
-    # TF-IDF score
-    tfidf_vec = tfidf.transform([query])
-    tfidf_scores = cosine_similarity(tfidf_vec, tfidf_matrix).flatten()
-
-    # SBERT score
-    sbert_vec = sbert.encode([query], convert_to_numpy=True)
-    sbert_scores = cosine_similarity(sbert_vec, sbert_matrix).flatten()
-
-    # Hybrid score
-    combined = 0.5 * tfidf_scores + 0.5 * sbert_scores
-
     df_copy = df.copy()
-    df_copy["score"] = combined
 
-    # Prevent NaN JSON crash
-    df_copy = df_copy.replace([np.nan, np.inf, -np.inf], 0)
+    # ===== 1️ Check if query matches adviser_name (case-insensitive, partial match) =====
+    adviser_mask = df_copy["adviser_name"].str.lower().str.contains(query.lower(), na=False)
+    if adviser_mask.any():
+        filtered = df_copy[adviser_mask]
+    else:
+        # ===== 2️ Otherwise, use TF-IDF + SBERT =====
+        # TF-IDF score
+        tfidf_vec = tfidf.transform([query])
+        tfidf_scores = cosine_similarity(tfidf_vec, tfidf_matrix).flatten()
 
-    df_copy = df_copy.sort_values(by="score", ascending=False)
+        # SBERT score
+        sbert_vec = sbert.encode([query], convert_to_numpy=True)
+        sbert_scores = cosine_similarity(sbert_vec, sbert_matrix).flatten()
 
-    # Filter by threshold
-    filtered = df_copy[df_copy["score"] >= 0.12]
+        # Hybrid score
+        combined = 0.5 * tfidf_scores + 0.5 * sbert_scores
+
+        df_copy["score"] = combined
+
+        # Prevent NaN JSON crash
+        df_copy = df_copy.replace([np.nan, np.inf, -np.inf], 0)
+
+        df_copy = df_copy.sort_values(by="score", ascending=False)
+
+        # Filter by threshold
+        filtered = df_copy[df_copy["score"] >= 0.12]
+
+    # ===== Pagination =====
+    start = (page - 1) * PAGE_SIZE
+    end = start + PAGE_SIZE
+    paginated = filtered.iloc[start:end]
 
     cols = list(df.columns)
-    cols.append("score")
+    if "score" in filtered.columns:
+        cols.append("score")
 
-    return filtered[cols].to_dict(orient="records")
+    return {
+        "total": len(filtered),
+        "page": page,
+        "page_size": PAGE_SIZE,
+        "data": paginated[cols].to_dict(orient="records"),
+    }
