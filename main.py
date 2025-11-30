@@ -29,53 +29,57 @@ app.add_middleware(
 # ===========================
 # Load Environment
 # ===========================
-print("🔐 Initializing Supabase connection...")
+print(" Initializing Supabase connection...")
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("❌ SUPABASE_URL or SUPABASE_KEY is missing from .env file")
+    raise ValueError("SUPABASE_URL or SUPABASE_KEY is missing from .env file")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ===========================
 # Load Theses (ONCE)
 # ===========================
-print("📥 Fetching theses from database...")
+print("Fetching theses from database...")
 response = supabase.table("theses").select("*").execute()
 df = pd.DataFrame(response.data)
 
 if df.empty:
-    raise ValueError("❌ No theses found in database")
+    raise ValueError("No theses found in database")
+
+#  FINAL SAFETY CLEAN (prevents ALL NaN forever)
+df = df.replace([np.nan, np.inf, -np.inf], "")
 
 # ===========================
 # Build Search Index 
 # ===========================
 df["text"] = (
-    df["title"].fillna("") + " " +
-    df["abstract"].fillna("") + " " +
-    df["adviser_name"].fillna("") + " " +
-    df["keywords"].fillna("").apply(lambda x: " ".join(x) if isinstance(x, list) else "") + " " +
-    df["proponents"].fillna("").apply(lambda x: " ".join(x) if isinstance(x, list) else "") + " " +
-    df["category"].fillna("").apply(lambda x: " ".join(x) if isinstance(x, list) else "")
+    df["title"] + " " +
+    df["abstract"] + " " +
+    df["adviser_name"] + " " +
+    df["keywords"].apply(lambda x: " ".join(x) if isinstance(x, list) else "") + " " +
+    df["proponents"].apply(lambda x: " ".join(x) if isinstance(x, list) else "") + " " +
+    df["category"].apply(lambda x: " ".join(x) if isinstance(x, list) else "")
 )
 
 # ===========================
 # Build Models (ONCE)
 # ===========================
-print("⚙️ Building TF-IDF + SBERT models...")
+print("Building TF-IDF + SBERT models...")
 
 tfidf = TfidfVectorizer(stop_words="english")
 tfidf_matrix = tfidf.fit_transform(df["text"])
 
 sbert = SentenceTransformer("all-MiniLM-L6-v2")
-sbert_matrix = sbert.encode(df["text"], convert_to_numpy=True)
+sbert_matrix = sbert.encode(df["text"].tolist(), convert_to_numpy=True)
 
-print("✅ AI models ready!")
+print("AI models ready!")
 
 PAGE_SIZE = 6  # number of theses per page
+
 
 # ===========================
 # SEARCH API
@@ -83,42 +87,56 @@ PAGE_SIZE = 6  # number of theses per page
 
 @app.get("/search")
 def search(query: str, page: int = Query(1, ge=1)):
+
     if not query.strip():
-        return []
+        return {
+            "total": 0,
+            "page": page,
+            "page_size": PAGE_SIZE,
+            "data": [],
+        }
 
     df_copy = df.copy()
+    q = query.lower()
 
-    # ===== 1️ Check if query matches adviser_name (case-insensitive, partial match) =====
-    adviser_mask = df_copy["adviser_name"].str.lower().str.contains(query.lower(), na=False)
+    # ===== 1️. Adviser Name Match =====
+    adviser_mask = df_copy["adviser_name"].str.lower().str.contains(q, na=False)
+
+    # ===== 2️. Proponents Match =====
+    proponents_text = df_copy["proponents"].apply(
+        lambda x: " ".join(x).lower() if isinstance(x, list) else str(x).lower()
+    )
+    proponents_mask = proponents_text.str.contains(q, na=False)
+
     if adviser_mask.any():
         filtered = df_copy[adviser_mask]
+
+    elif proponents_mask.any():
+        filtered = df_copy[proponents_mask]
+
     else:
-        # ===== 2️ Otherwise, use TF-IDF + SBERT =====
-        # TF-IDF score
+        # ===== 3️. Semantic Search (TF-IDF + SBERT) =====
         tfidf_vec = tfidf.transform([query])
         tfidf_scores = cosine_similarity(tfidf_vec, tfidf_matrix).flatten()
 
-        # SBERT score
         sbert_vec = sbert.encode([query], convert_to_numpy=True)
         sbert_scores = cosine_similarity(sbert_vec, sbert_matrix).flatten()
 
-        # Hybrid score
         combined = 0.5 * tfidf_scores + 0.5 * sbert_scores
 
         df_copy["score"] = combined
-
-        # Prevent NaN JSON crash
         df_copy = df_copy.replace([np.nan, np.inf, -np.inf], 0)
 
         df_copy = df_copy.sort_values(by="score", ascending=False)
-
-        # Filter by threshold
         filtered = df_copy[df_copy["score"] >= 0.12]
 
     # ===== Pagination =====
     start = (page - 1) * PAGE_SIZE
     end = start + PAGE_SIZE
     paginated = filtered.iloc[start:end]
+
+    # Final NaN safety before JSON
+    paginated = paginated.replace([np.nan, np.inf, -np.inf], None)
 
     cols = list(df.columns)
     if "score" in filtered.columns:
