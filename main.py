@@ -58,7 +58,6 @@ df = df.replace([np.nan, np.inf, -np.inf], "")
 # ===========================
 df["text"] = (
     df["title"] + " " +
-    df["abstract"] + " " +
     df["adviser_name"] + " " +
     df["keywords"].apply(lambda x: " ".join(x) if isinstance(x, list) else "") + " " +
     df["proponents"].apply(lambda x: " ".join(x) if isinstance(x, list) else "") + " " +
@@ -100,13 +99,18 @@ def search(query: str, page: int = Query(1, ge=1)):
     q = query.lower()
 
     # ===== 1️. Adviser Name Match =====
-    adviser_mask = df_copy["adviser_name"].str.lower().str.contains(q, na=False)
+    adviser_mask = df_copy["adviser_name"].str.lower().str.contains(
+    rf"\b{q}\b", regex=True, na=False
+    )
 
     # ===== 2️. Proponents Match =====
     proponents_text = df_copy["proponents"].apply(
         lambda x: " ".join(x).lower() if isinstance(x, list) else str(x).lower()
     )
-    proponents_mask = proponents_text.str.contains(q, na=False)
+    proponents_mask = proponents_text.str.contains(
+    rf"\b{q}\b", regex=True, na=False
+    )
+
 
     if adviser_mask.any():
         filtered = df_copy[adviser_mask]
