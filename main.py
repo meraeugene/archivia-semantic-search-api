@@ -86,7 +86,6 @@ PAGE_SIZE = 6  # number of theses per page
 
 @app.get("/search")
 def search(query: str, page: int = Query(1, ge=1)):
-
     if not query.strip():
         return {
             "total": 0,
@@ -95,31 +94,46 @@ def search(query: str, page: int = Query(1, ge=1)):
             "data": [],
         }
 
-    df_copy = df.copy()
+    # Fetch latest theses from Supabase
+    response = supabase.table("theses").select("*").execute()
+    df = pd.DataFrame(response.data)
+    if df.empty:
+        return {"total": 0, "page": page, "page_size": PAGE_SIZE, "data": []}
+
+    df = df.replace([np.nan, np.inf, -np.inf], "")
+
+    # Build text for search
+    df["text"] = (
+        df["title"] + " " +
+        df["adviser_name"] + " " +
+        df["keywords"].apply(lambda x: " ".join(x) if isinstance(x, list) else "") + " " +
+        df["proponents"].apply(lambda x: " ".join(x) if isinstance(x, list) else "") + " " +
+        df["category"].apply(lambda x: " ".join(x) if isinstance(x, list) else "")
+    )
+
     q = query.lower()
 
-    # ===== 1️. Adviser Name Match =====
-    adviser_mask = df_copy["adviser_name"].str.lower().str.contains(
-    rf"\b{q}\b", regex=True, na=False
-    )
+    # ===== 1. Adviser Name Match =====
+    adviser_mask = df["adviser_name"].str.lower().str.contains(rf"\b{q}\b", regex=True, na=False)
 
-    # ===== 2️. Proponents Match =====
-    proponents_text = df_copy["proponents"].apply(
+    # ===== 2. Proponents Match =====
+    proponents_text = df["proponents"].apply(
         lambda x: " ".join(x).lower() if isinstance(x, list) else str(x).lower()
     )
-    proponents_mask = proponents_text.str.contains(
-    rf"\b{q}\b", regex=True, na=False
-    )
-
+    proponents_mask = proponents_text.str.contains(rf"\b{q}\b", regex=True, na=False)
 
     if adviser_mask.any():
-        filtered = df_copy[adviser_mask]
-
+        filtered = df[adviser_mask]
     elif proponents_mask.any():
-        filtered = df_copy[proponents_mask]
-
+        filtered = df[proponents_mask]
     else:
-        # ===== 3️. Semantic Search (TF-IDF + SBERT) =====
+        # ===== 3. Semantic Search (TF-IDF + SBERT) =====
+        tfidf = TfidfVectorizer(stop_words="english")
+        tfidf_matrix = tfidf.fit_transform(df["text"])
+
+        sbert = SentenceTransformer("all-MiniLM-L6-v2")
+        sbert_matrix = sbert.encode(df["text"].tolist(), convert_to_numpy=True)
+
         tfidf_vec = tfidf.transform([query])
         tfidf_scores = cosine_similarity(tfidf_vec, tfidf_matrix).flatten()
 
@@ -128,18 +142,15 @@ def search(query: str, page: int = Query(1, ge=1)):
 
         combined = 0.5 * tfidf_scores + 0.5 * sbert_scores
 
-        df_copy["score"] = combined
-        df_copy = df_copy.replace([np.nan, np.inf, -np.inf], 0)
+        df["score"] = combined
+        df = df.replace([np.nan, np.inf, -np.inf], 0)
+        df = df.sort_values(by="score", ascending=False)
+        filtered = df[df["score"] >= 0.12]
 
-        df_copy = df_copy.sort_values(by="score", ascending=False)
-        filtered = df_copy[df_copy["score"] >= 0.12]
-
-    # ===== Pagination =====
+    # Pagination
     start = (page - 1) * PAGE_SIZE
     end = start + PAGE_SIZE
     paginated = filtered.iloc[start:end]
-
-    # Final NaN safety before JSON
     paginated = paginated.replace([np.nan, np.inf, -np.inf], None)
 
     cols = list(df.columns)
