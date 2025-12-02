@@ -156,26 +156,30 @@ class ThesisUpload(BaseModel):
 def upload_thesis(new_thesis: ThesisUpload):
     global df, sbert, index
 
-    # Convert Pydantic model to dict
-    new_row = new_thesis.dict()
+    # Reload latest theses from Supabase
+    response = supabase.table("theses").select("*").execute()
+    df = pd.DataFrame(response.data)
 
-    # Build combined text for semantic search
-    new_text = (
-        new_row["title"] + " " +
-        new_row["adviser_name"] + " " +
-        " ".join(new_row.get("keywords", [])) + " " +
-        " ".join(new_row.get("proponents", [])) + " " +
-        " ".join(new_row.get("category", []))
+    if df.empty:
+        df = pd.DataFrame([new_thesis.dict()])
+    else:
+        new_row = new_thesis.dict()
+        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+
+    # Rebuild text column
+    df["text"] = (
+        df["title"] + " " +
+        df["adviser_name"] + " " +
+        df["keywords"].apply(lambda x: " ".join(x) if isinstance(x, list) else "") + " " +
+        df["proponents"].apply(lambda x: " ".join(x) if isinstance(x, list) else "") + " " +
+        df["category"].apply(lambda x: " ".join(x) if isinstance(x, list) else "")
     )
 
-    # Compute SBERT embedding
-    new_vec = sbert.encode([new_text], convert_to_numpy=True)
-    faiss.normalize_L2(new_vec)
+    # Rebuild FAISS index
+    sbert_matrix = sbert.encode(df["text"].tolist(), convert_to_numpy=True)
+    d = sbert_matrix.shape[1]
+    index = faiss.IndexFlatIP(d)
+    faiss.normalize_L2(sbert_matrix)
+    index.add(sbert_matrix)
 
-    # Add to FAISS index
-    index.add(new_vec)
-
-    # Append to dataframe
-    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-
-    return {"message": "Thesis uploaded and indexed successfully!"}
+    return {"message": "Thesis uploaded and fully reindexed!"}
