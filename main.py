@@ -135,3 +135,47 @@ def search(query: str, page: int = Query(1, ge=1)):
         "page_size": PAGE_SIZE,
         "data": paginated[cols].to_dict(orient="records"),
     }
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import pandas as pd
+import faiss
+import numpy as np
+
+# ===========================
+# Pydantic model for new thesis
+# ===========================
+class ThesisUpload(BaseModel):
+    title: str
+    adviser_name: str
+    keywords: list[str] = []
+    proponents: list[str] = []
+    category: list[str] = []
+
+@app.post("/upload")
+def upload_thesis(new_thesis: ThesisUpload):
+    global df, sbert, index
+
+    # Convert Pydantic model to dict
+    new_row = new_thesis.dict()
+
+    # Build combined text for semantic search
+    new_text = (
+        new_row["title"] + " " +
+        new_row["adviser_name"] + " " +
+        " ".join(new_row.get("keywords", [])) + " " +
+        " ".join(new_row.get("proponents", [])) + " " +
+        " ".join(new_row.get("category", []))
+    )
+
+    # Compute SBERT embedding
+    new_vec = sbert.encode([new_text], convert_to_numpy=True)
+    faiss.normalize_L2(new_vec)
+
+    # Add to FAISS index
+    index.add(new_vec)
+
+    # Append to dataframe
+    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+
+    return {"message": "Thesis uploaded and indexed successfully!"}
