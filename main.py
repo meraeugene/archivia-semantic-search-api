@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -8,6 +8,8 @@ import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
 import faiss
+from pydantic import BaseModel
+
 
 # ===========================
 # FastAPI Setup
@@ -136,11 +138,6 @@ def search(query: str, page: int = Query(1, ge=1)):
         "data": paginated[cols].to_dict(orient="records"),
     }
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import pandas as pd
-import faiss
-import numpy as np
 
 # ===========================
 # Pydantic model for new thesis
@@ -183,3 +180,39 @@ def upload_thesis(new_thesis: ThesisUpload):
     index.add(sbert_matrix)
 
     return {"message": "Thesis uploaded and fully reindexed!"}
+
+@app.delete("/delete/{thesis_id}")
+def delete_thesis_from_index(thesis_id: int):
+    global df, sbert, index
+
+    try:
+        # Reload all remaining theses from Supabase
+        response = supabase.table("theses").select("*").execute()
+        df = pd.DataFrame(response.data)
+
+        if df.empty:
+            # If no data remains, reset the FAISS index safely
+            index = faiss.IndexFlatIP(384)  # MiniLM vector size
+            return {"message": "All theses deleted. Index reset."}
+
+        #  Safe text rebuild
+        df["text"] = (
+            df["title"].fillna("") + " " +
+            df["adviser_name"].fillna("") + " " +
+            df["keywords"].apply(lambda x: " ".join(x) if isinstance(x, list) else "") + " " +
+            df["proponents"].apply(lambda x: " ".join(x) if isinstance(x, list) else "") + " " +
+            df["category"].apply(lambda x: " ".join(x) if isinstance(x, list) else "")
+        )
+
+        # Full FAISS rebuild
+        sbert_matrix = sbert.encode(df["text"].tolist(), convert_to_numpy=True)
+        d = sbert_matrix.shape[1]
+        index = faiss.IndexFlatIP(d)
+        faiss.normalize_L2(sbert_matrix)
+        index.add(sbert_matrix)
+
+        return {"message": f"Thesis {thesis_id} deleted and FAISS index rebuilt"}
+
+    except Exception as e:
+        print("DELETE INDEX ERROR:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
