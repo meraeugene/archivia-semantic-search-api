@@ -3,12 +3,11 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
-
+import faiss
 
 # ===========================
 # FastAPI Setup
@@ -29,7 +28,7 @@ app.add_middleware(
 # ===========================
 # Load Environment
 # ===========================
-print(" Initializing Supabase connection...")
+print("Initializing Supabase connection...")
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -50,12 +49,10 @@ df = pd.DataFrame(response.data)
 if df.empty:
     raise ValueError("No theses found in database")
 
-#  FINAL SAFETY CLEAN (prevents ALL NaN forever)
+# Replace NaN/inf
 df = df.replace([np.nan, np.inf, -np.inf], "")
 
-# ===========================
-# Build Search Index 
-# ===========================
+# Build combined text field for search
 df["text"] = (
     df["title"] + " " +
     df["adviser_name"] + " " +
@@ -69,47 +66,31 @@ df["text"] = (
 # ===========================
 print("Building TF-IDF + SBERT models...")
 
+# TF-IDF (optional, still precompute if needed)
 tfidf = TfidfVectorizer(stop_words="english")
 tfidf_matrix = tfidf.fit_transform(df["text"])
 
+# SBERT
 sbert = SentenceTransformer("all-MiniLM-L6-v2")
 sbert_matrix = sbert.encode(df["text"].tolist(), convert_to_numpy=True)
+
+# FAISS index for fast semantic search
+d = sbert_matrix.shape[1]
+index = faiss.IndexFlatIP(d)  # cosine similarity
+faiss.normalize_L2(sbert_matrix)
+index.add(sbert_matrix)
 
 print("AI models ready!")
 
 PAGE_SIZE = 6  # number of theses per page
 
-
 # ===========================
 # SEARCH API
 # ===========================
-
 @app.get("/search")
 def search(query: str, page: int = Query(1, ge=1)):
     if not query.strip():
-        return {
-            "total": 0,
-            "page": page,
-            "page_size": PAGE_SIZE,
-            "data": [],
-        }
-
-    # Fetch latest theses from Supabase
-    response = supabase.table("theses").select("*").execute()
-    df = pd.DataFrame(response.data)
-    if df.empty:
         return {"total": 0, "page": page, "page_size": PAGE_SIZE, "data": []}
-
-    df = df.replace([np.nan, np.inf, -np.inf], "")
-
-    # Build text for search
-    df["text"] = (
-        df["title"] + " " +
-        df["adviser_name"] + " " +
-        df["keywords"].apply(lambda x: " ".join(x) if isinstance(x, list) else "") + " " +
-        df["proponents"].apply(lambda x: " ".join(x) if isinstance(x, list) else "") + " " +
-        df["category"].apply(lambda x: " ".join(x) if isinstance(x, list) else "")
-    )
 
     q = query.lower()
 
@@ -123,36 +104,27 @@ def search(query: str, page: int = Query(1, ge=1)):
     proponents_mask = proponents_text.str.contains(rf"\b{q}\b", regex=True, na=False)
 
     if adviser_mask.any():
-        filtered = df[adviser_mask]
+        filtered = df[adviser_mask].copy()
     elif proponents_mask.any():
-        filtered = df[proponents_mask]
+        filtered = df[proponents_mask].copy()
     else:
-        # ===== 3. Semantic Search (TF-IDF + SBERT) =====
-        tfidf = TfidfVectorizer(stop_words="english")
-        tfidf_matrix = tfidf.fit_transform(df["text"])
+        # ===== 3. Semantic Search (FAISS + SBERT) =====
+        q_vec = sbert.encode([query], convert_to_numpy=True)
+        faiss.normalize_L2(q_vec)
+        D, I = index.search(q_vec, k=len(df))  # search all
+        scores = D.flatten()
+        filtered = df.iloc[I[0]].copy()
+        filtered["score"] = scores
 
-        sbert = SentenceTransformer("all-MiniLM-L6-v2")
-        sbert_matrix = sbert.encode(df["text"].tolist(), convert_to_numpy=True)
-
-        tfidf_vec = tfidf.transform([query])
-        tfidf_scores = cosine_similarity(tfidf_vec, tfidf_matrix).flatten()
-
-        sbert_vec = sbert.encode([query], convert_to_numpy=True)
-        sbert_scores = cosine_similarity(sbert_vec, sbert_matrix).flatten()
-
-        combined = 0.5 * tfidf_scores + 0.5 * sbert_scores
-
-        df["score"] = combined
-        df = df.replace([np.nan, np.inf, -np.inf], 0)
-        df = df.sort_values(by="score", ascending=False)
-        filtered = df[df["score"] >= 0.12]
+        # Filter low scores
+        filtered = filtered[filtered["score"] >= 0.12]
 
     # Pagination
     start = (page - 1) * PAGE_SIZE
     end = start + PAGE_SIZE
-    paginated = filtered.iloc[start:end]
-    paginated = paginated.replace([np.nan, np.inf, -np.inf], None)
+    paginated = filtered.iloc[start:end].replace([np.nan, np.inf, -np.inf], None)
 
+    # Columns to return
     cols = list(df.columns)
     if "score" in filtered.columns:
         cols.append("score")
